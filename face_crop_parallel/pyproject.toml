@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "face-crop-parallel"
+version = "0.1.0"
+description = "Parallel face crop preprocessing using YuNet (CPU-only)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["face-detection", "face-crop", "preprocessing", "yunet", "multiprocessing"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "opencv-contrib-python>=4.8.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+]
+
+[project.scripts]
+face-crop-parallel = "face_crop_parallel._core:main"
+
+[project.urls]
+Repository = "https://github.com/zenryokukikai/ml-tools"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["face_crop_parallel*"]
