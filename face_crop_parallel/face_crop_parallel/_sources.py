@@ -105,6 +105,23 @@ class VADSource(VideoSource):
         self.vad_dir    = str(vad_dir)
         self.target_fps = target_fps
         self.video_exts = frozenset(video_exts) if video_exts else _DEFAULT_VIDEO_EXTS
+        self._cached_path: str = ""
+        self._cached_cap = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_cached_path"] = ""
+        state["_cached_cap"] = None
+        return state
+
+    def _get_cap(self, video_path: str):
+        """同一動画の連続セグメントで VideoCapture を使い回す。"""
+        if self._cached_path != video_path:
+            if self._cached_cap is not None:
+                self._cached_cap.release()
+            self._cached_cap = cv2.VideoCapture(video_path)
+            self._cached_path = video_path
+        return self._cached_cap
 
     def discover(self, out_dir: Path) -> Tuple[List[VADClipTask], int, int]:
         videos_root = Path(self.videos_dir)
@@ -154,42 +171,39 @@ class VADSource(VideoSource):
                 f"VADSource requires VADClipTask, got {type(task).__name__}"
             )
 
-        cap = cv2.VideoCapture(task.video_path)
-        try:
-            native_fps  = task.native_fps
-            start_frame = int(task.segment_start * native_fps)
-            end_frame   = int(task.segment_end * native_fps)
+        cap = self._get_cap(task.video_path)
+        native_fps  = task.native_fps
+        start_frame = int(task.segment_start * native_fps)
+        end_frame   = int(task.segment_end * native_fps)
 
-            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-            if native_fps <= task.target_fps:
-                for _ in range(end_frame - start_frame):
-                    ok, frame = cap.read()
-                    if not ok:
-                        break
-                    yield frame
-            else:
-                ratio   = native_fps / task.target_fps
-                n_target = max(
-                    1,
-                    int((task.segment_end - task.segment_start) * task.target_fps),
-                )
-                current_pos = start_frame
+        if native_fps <= task.target_fps:
+            for _ in range(end_frame - start_frame):
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                yield frame
+        else:
+            ratio   = native_fps / task.target_fps
+            n_target = max(
+                1,
+                int((task.segment_end - task.segment_start) * task.target_fps),
+            )
+            current_pos = start_frame
 
-                for t in range(n_target):
-                    target_src = start_frame + int(t * ratio)
-                    if target_src >= end_frame:
-                        break
-                    while current_pos < target_src:
-                        cap.grab()
-                        current_pos += 1
-                    ok, frame = cap.read()
-                    if not ok:
-                        break
+            for t in range(n_target):
+                target_src = start_frame + int(t * ratio)
+                if target_src >= end_frame:
+                    break
+                while current_pos < target_src:
+                    cap.grab()
                     current_pos += 1
-                    yield frame
-        finally:
-            cap.release()
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                current_pos += 1
+                yield frame
 
     def count_frames(self, tasks: List[ClipTask]) -> int:
         total = 0

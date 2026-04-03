@@ -45,6 +45,8 @@ DEFAULT_BBOX_MARGIN  = 0.25
 DEFAULT_FACE_SIZE    = 192
 DEFAULT_JPEG_QUALITY = 95
 DEFAULT_WORKERS      = 8
+DEFAULT_DET_MAX_LONG   = 640
+DEFAULT_DET_CENTER_CROP = 1.0
 COORDS_FILE          = "coords.npy"
 COUNTER_FLUSH_EVERY  = 50
 
@@ -60,7 +62,7 @@ class ClipTask:
     Attributes:
         video_path: 入力動画のパス
         clip_id:    出力サブディレクトリ名 (例: "00042")
-        video_name: 出力親ディレクトリ名 (例: "20251220_DJI_0098")
+        video_name: 出力親ディレクトリ名 (例: "video_001")
     """
     video_path: str
     clip_id: str
@@ -193,6 +195,9 @@ def _det_box_to_orig_xy(
 # ワーカープロセス本体
 # ---------------------------------------------------------------------------
 
+_PROFILE_INTERVAL = 30.0  # 秒ごとにプロファイルログを出力
+
+
 def _worker(
     worker_id:      int,
     tasks:          list,
@@ -203,6 +208,8 @@ def _worker(
     bbox_margin:    float,
     face_size:      int,
     jpeg_quality:   int,
+    det_max_long:   int,
+    det_center_crop: float,
     frames_counter,
     clips_counter,
 ) -> None:
@@ -235,6 +242,15 @@ def _worker(
     local_frames   = 0
     flushed_frames = 0
 
+    t_decode_total    = 0.0
+    t_resize_total    = 0.0
+    t_detect_total    = 0.0
+    t_crop_save_total = 0.0
+    prof_frames     = 0
+    prof_clips      = 0
+    prof_last       = time.time()
+    prof_start      = prof_last
+
     for task in tasks:
         clip_out    = out_root / task.video_name / task.clip_id
         coords_path = clip_out / COORDS_FILE
@@ -245,24 +261,48 @@ def _worker(
         frame_w = frame_h = det_w = det_h = 0
 
         scale_x = scale_y = det_scale
+        roi_x0 = 0
 
-        for frame in source.iter_frames(task):
+        t_before_next = time.time()
+        frame_iter = source.iter_frames(task)
+
+        for frame in frame_iter:
+            t_after_decode = time.time()
+            t_decode_total += t_after_decode - t_before_next
+
             if frame_idx == 0:
                 frame_h, frame_w = frame.shape[:2]
-                det_w = max(32, int(frame_w * det_scale) // 32 * 32)
+                roi_x0 = 0
+                roi_w = frame_w
+                if det_center_crop < 1.0 and frame_w > frame_h:
+                    roi_w = int(frame_w * det_center_crop)
+                    roi_x0 = (frame_w - roi_w) // 2
+                det_w = max(32, int(roi_w * det_scale) // 32 * 32)
                 det_h = max(32, int(frame_h * det_scale) // 32 * 32)
-                scale_x = det_w / frame_w
+                if det_max_long > 0 and max(det_w, det_h) > det_max_long:
+                    shrink = det_max_long / max(det_w, det_h)
+                    det_w = max(32, int(det_w * shrink) // 32 * 32)
+                    det_h = max(32, int(det_h * shrink) // 32 * 32)
+                scale_x = det_w / roi_w
                 scale_y = det_h / frame_h
                 detector.setInputSize((det_w, det_h))
 
-            small    = cv2.resize(frame, (det_w, det_h))
+            t2 = time.time()
+            roi = frame[:, roi_x0:roi_x0 + roi_w] if roi_x0 > 0 else frame
+            small = cv2.resize(roi, (det_w, det_h))
+            t3 = time.time()
             _, faces = detector.detect(small)
-            box      = select_best_face(faces, det_w, det_h)
+            t4 = time.time()
+
+            box = select_best_face(faces, det_w, det_h)
 
             if box is not None:
                 coord = _det_box_to_orig_xy(
-                    box, scale_x, scale_y, frame_w, frame_h, bbox_margin,
+                    box, scale_x, scale_y, roi_w, frame_h, bbox_margin,
                 )
+                if roi_x0 > 0:
+                    coord[0] = min(coord[0] + roi_x0, frame_w)
+                    coord[2] = min(coord[2] + roi_x0, frame_w)
                 coords_list.append(coord)
                 x1, y1, x2, y2 = coord
                 face_raw = frame[y1:y2, x1:x2]
@@ -279,8 +319,17 @@ def _worker(
             else:
                 coords_list.append([-1, -1, -1, -1])
 
+            t5 = time.time()
+
+            t_resize_total    += t3 - t2
+            t_detect_total    += t4 - t3
+            t_crop_save_total += t5 - t4
+
+            t_before_next = time.time()
+
             frame_idx    += 1
             local_frames += 1
+            prof_frames  += 1
 
             if (local_frames - flushed_frames) >= COUNTER_FLUSH_EVERY:
                 with frames_counter.get_lock():
@@ -300,6 +349,27 @@ def _worker(
 
         with clips_counter.get_lock():
             clips_counter.value += 1
+
+        prof_clips += 1
+        now = time.time()
+        if now - prof_last >= _PROFILE_INTERVAL:
+            wall = now - prof_start
+            fps  = prof_frames / wall if wall > 0 else 0
+            print(
+                f"[worker {worker_id}] PROFILE "
+                f"wall={wall:.1f}s frames={prof_frames} clips={prof_clips} "
+                f"fps={fps:.1f} | "
+                f"decode={t_decode_total:.2f}s "
+                f"resize={t_resize_total:.2f}s "
+                f"detect={t_detect_total:.2f}s "
+                f"crop_save={t_crop_save_total:.2f}s | "
+                f"det_size={det_w}x{det_h} "
+                f"roi_x0={roi_x0} "
+                f"src={frame_w}x{frame_h} "
+                f"video={task.video_name}",
+                flush=True,
+            )
+            prof_last = now
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +419,8 @@ def run(
     bbox_margin:  float = DEFAULT_BBOX_MARGIN,
     face_size:    int   = DEFAULT_FACE_SIZE,
     jpeg_quality: int   = DEFAULT_JPEG_QUALITY,
+    det_max_long:   int   = DEFAULT_DET_MAX_LONG,
+    det_center_crop: float = DEFAULT_DET_CENTER_CROP,
 ) -> None:
     """VideoSource からフレームを受け取り、顔を検出・クロップして JPEG 保存する。
 
@@ -374,9 +446,13 @@ def run(
 
     ctx = mp.get_context("spawn")
 
+    video_groups: dict = {}
+    for task in pending:
+        video_groups.setdefault(task.video_name, []).append(task)
+
     chunks = [[] for _ in range(workers)]
-    for i, task in enumerate(pending):
-        chunks[i % workers].append(task)
+    for i, (_, group) in enumerate(sorted(video_groups.items())):
+        chunks[i % workers].extend(group)
 
     frames_counter = ctx.Value('i', 0)
     clips_counter  = ctx.Value('i', skipped)
@@ -400,6 +476,7 @@ def run(
                 wid, chunk, out_dir, yunet,
                 source,
                 det_scale, bbox_margin, face_size, jpeg_quality,
+                det_max_long, det_center_crop,
                 frames_counter, clips_counter,
             ),
         )
@@ -462,6 +539,10 @@ def main() -> None:
     parser.add_argument("--face_size",    type=int,   default=DEFAULT_FACE_SIZE,
                         help="Output JPEG size (square, px)")
     parser.add_argument("--jpeg_quality", type=int,   default=DEFAULT_JPEG_QUALITY)
+    parser.add_argument("--det_max_long", type=int,   default=DEFAULT_DET_MAX_LONG,
+                        help="Cap detection longest side (0=unlimited)")
+    parser.add_argument("--det_center_crop", type=float, default=DEFAULT_DET_CENTER_CROP,
+                        help="Center crop ratio for landscape detection (1.0=no crop)")
     args = parser.parse_args()
 
     try:
@@ -485,6 +566,8 @@ def main() -> None:
         bbox_margin=args.bbox_margin,
         face_size=args.face_size,
         jpeg_quality=args.jpeg_quality,
+        det_max_long=args.det_max_long,
+        det_center_crop=args.det_center_crop,
     )
 
 
