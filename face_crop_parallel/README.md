@@ -7,15 +7,48 @@
 - **YuNet** (OpenCV 組み込み, CPU のみ) で高速顔検出 ─ GPU 不要
 - **マルチプロセス (spawn)** で並列化 ─ GIL を回避し CPU コア数に比例してスケール
 - **ストリーミングデコード** ─ 1 フレームずつ処理して大容量動画のメモリ使用量を抑制
-- **再開可能** ─ `coords.npy` + JPEG 枚数が一致するクリップを自動スキップ
+- **再開可能** ─ `coords.npy` + JPEG 枚数が一致するタスクを自動スキップ
 - **tqdm** でフレーム単位のスループット / ETA をリアルタイム表示
+- **VideoSource プラグイン** ─ 入力形式を抽象化。クリップ群 / VAD セグメント / カスタムソースを切替可能
+
+## 入力モード
+
+### Clip モード (デフォルト)
+
+事前に分割済みのクリップ `.mp4` 群を処理する。
+
+```
+clips_dir/{video_name}/{clip_name}.mp4
+```
+
+### VAD モード
+
+元動画 + VAD (Voice Activity Detection) の結果 JSON から、発話区間のみを切り出して処理する。
+ffmpeg による中間クリップ生成が不要になり、ディスク使用量と処理時間を大幅に削減できる。
+
+```
+videos_dir/{stem}.mp4
+vad_dir/{stem}/vad.json
+```
+
+**vad.json フォーマット:**
+
+```json
+{
+  "segments": [
+    {"start": 0.5, "end": 3.2},
+    {"start": 10.1, "end": 15.8}
+  ],
+  "total_duration": 120.0
+}
+```
 
 ## 出力形式
 
 ```
 out_dir/
   {video_name}/
-    {clip_name}/
+    {clip_id}/
       0.jpg, 1.jpg, ...    # 顔検出に成功したフレームのみ (0-indexed)
       coords.npy           # 全フレームの座標キャッシュ
 ```
@@ -47,36 +80,77 @@ wget https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/f
 
 ## 使い方
 
+### CLI
+
 ```bash
-# コマンドとして実行 (pip install 後)
+# Clip モード
 face-crop-parallel \
   --clips_dir /path/to/clips \
   --out_dir   /path/to/output \
   --yunet     /path/to/face_detection_yunet_2023mar.onnx \
   --workers   16
 
-# モジュールとして実行
-python -m face_crop_parallel \
-  --clips_dir /path/to/clips \
-  --out_dir   /path/to/output \
-  --yunet     /path/to/face_detection_yunet_2023mar.onnx \
-  --workers   16
+# VAD モード
+face-crop-parallel \
+  --videos_dir /path/to/videos \
+  --vad_dir    /path/to/vad_output \
+  --out_dir    /path/to/output \
+  --yunet      /path/to/face_detection_yunet_2023mar.onnx \
+  --workers    16 \
+  --target_fps 25
 ```
 
-### 入力ディレクトリ構造
+### Python API
 
+```python
+from face_crop_parallel import run, DefaultClipSource, VADSource
+
+# Clip モード
+source = DefaultClipSource("/path/to/clips")
+run(source=source, out_dir="/path/to/output", yunet="model.onnx", workers=16)
+
+# VAD モード
+source = VADSource("/path/to/videos", "/path/to/vad_output", target_fps=25.0)
+run(source=source, out_dir="/path/to/output", yunet="model.onnx", workers=16)
 ```
-clips_dir/
-  {video_name}/
-    {clip_name}.mp4
-    ...
+
+### カスタム VideoSource
+
+`VideoSource` を継承して独自の入力形式に対応できる。
+
+```python
+from face_crop_parallel import ClipTask, VideoSource, run
+
+class MyCustomSource(VideoSource):
+    def discover(self, out_dir):
+        # 処理対象の ClipTask リストを返す
+        tasks = [ClipTask(video_path="...", clip_id="...", video_name="...")]
+        return tasks, 0, len(tasks)  # (pending, skipped, total)
+
+    def iter_frames(self, task):
+        # BGR フレームを yield
+        cap = cv2.VideoCapture(task.video_path)
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            yield frame
+        cap.release()
+
+    def count_frames(self, tasks):
+        return sum(...)  # 推定フレーム数
+
+run(source=MyCustomSource(), out_dir="output", yunet="model.onnx")
 ```
 
 ### オプション
 
 | 引数 | デフォルト | 説明 |
 |------|-----------|------|
-| `--clips_dir` | (必須) | 入力動画クリップのルートディレクトリ |
+| `--clips_dir` | - | Clip モード: 入力動画クリップのルートディレクトリ |
+| `--videos_dir` | - | VAD モード: 元動画のディレクトリ |
+| `--vad_dir` | - | VAD モード: `{stem}/vad.json` を含むディレクトリ |
+| `--target_fps` | 25.0 | VAD モード: 出力フレームレート (fps 変換) |
 | `--out_dir` | (必須) | 出力先ディレクトリ |
 | `--yunet` | (必須) | YuNet ONNX モデルのパス |
 | `--workers` | 8 | 並列ワーカー数 |
@@ -98,6 +172,17 @@ clips_dir/
 - 上記環境では `--workers 16` が最速。コア数の異なる環境では適宜調整すること。
 
 ## 設計上の注意
+
+### VideoSource プラグインアーキテクチャ
+
+`VideoSource` は動画入力を抽象化するインターフェース。以下の制約を満たす必要がある:
+
+- **pickle 可能** であること (spawn コンテキストでワーカーに渡すため)
+- `iter_frames()` 内で `cv2.VideoCapture` を開くこと (ファイルハンドルを保持しない)
+
+組み込み実装:
+- `DefaultClipSource`: クリップ `.mp4` 群を処理 (v0.1 互換)
+- `VADSource`: 元動画 + `vad.json` から発話区間のみを切り出し + fps 変換
 
 ### CPU 競合の回避
 
@@ -121,7 +206,6 @@ frames_counter = ctx.Value('i', 0)   # NG: mp.Value('i', 0)
 前処理を中断・再開する場合は先に整合性チェックを行うことを推奨:
 
 ```python
-# coords.npy なし、または JPEG 枚数不一致のクリップディレクトリを削除して再処理
 import shutil, numpy as np
 from pathlib import Path
 

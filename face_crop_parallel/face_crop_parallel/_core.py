@@ -1,35 +1,24 @@
 """
-face_crop_parallel.py - YuNet による並列顔クロップ前処理ツール
+face_crop_parallel._core - YuNet による並列顔クロップの中核モジュール
 
-動画クリップ群から顔領域を検出・クロップして正方形 JPEG として保存する。
-検出座標は coords.npy にキャッシュされ、次回実行時はスキップされる。
+VideoSource プラグインで入力形式を切り替え可能:
+- DefaultClipSource: クリップ .mp4 群から全フレームを処理 (従来互換)
+- VADSource: 元動画 + vad.json からセグメントを切り出して fps 変換
 
 特徴:
 - YuNet (OpenCV 組み込み, CPU のみ) で高速顔検出
 - マルチプロセス (spawn) で並列化 ─ GIL を回避
 - OpenCV / OpenMP / MKL スレッドを各ワーカー内で 1 に制限し CPU 競合を防止
 - ストリーミングデコード ─ 1 フレームずつ処理してメモリ使用量を抑制
-- 再開可能 ─ coords.npy + JPEG 枚数が一致するクリップは自動スキップ
+- 再開可能 ─ coords.npy + JPEG 枚数が一致するタスクは自動スキップ
 - tqdm でフレーム単位のスループット / ETA をリアルタイム表示
 
-入出力ディレクトリ構造:
-  clips_dir/
-    {video_name}/
-      {clip_name}.mp4
-
-  out_dir/
-    {video_name}/
-      {clip_name}/
-        0.jpg, 1.jpg, ...   (顔検出フレームのみ、0-indexed)
-        coords.npy          shape=(N_frames, 4), dtype=int32
-                            [x1,y1,x2,y2] or [-1,-1,-1,-1] (未検出)
-
 Usage:
-  python face_crop_parallel.py \\
-    --clips_dir /path/to/clips \\
-    --out_dir   /path/to/output \\
-    --yunet     /path/to/face_detection_yunet_2023mar.onnx \\
-    --workers   16
+  # Clip mode (default)
+  face-crop-parallel --clips_dir clips/ --out_dir out/ --yunet model.onnx
+
+  # VAD mode
+  face-crop-parallel --videos_dir videos/ --vad_dir vad/ --out_dir out/ --yunet model.onnx
 
 YuNet モデルのダウンロード:
   https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet
@@ -39,7 +28,9 @@ import argparse
 import os
 import cv2
 import numpy as np
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator, List, Tuple
 import multiprocessing as mp
 import threading
 import time
@@ -49,26 +40,83 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # デフォルト定数 (CLI 引数で上書き可能)
 # ---------------------------------------------------------------------------
-DEFAULT_DET_SCALE    = 0.5    # 検出用縮小率 (大きな解像度の動画を高速処理するため)
-DEFAULT_BBOX_MARGIN  = 0.25   # 検出ボックスを各辺 25% 拡張
-DEFAULT_FACE_SIZE    = 192    # 出力 JPEG のサイズ (正方形, px)
+DEFAULT_DET_SCALE    = 0.5
+DEFAULT_BBOX_MARGIN  = 0.25
+DEFAULT_FACE_SIZE    = 192
 DEFAULT_JPEG_QUALITY = 95
 DEFAULT_WORKERS      = 8
 COORDS_FILE          = "coords.npy"
-COUNTER_FLUSH_EVERY  = 50     # N フレームごとに共有カウンタを更新 (ロック競合低減)
+COUNTER_FLUSH_EVERY  = 50
 
 
 # ---------------------------------------------------------------------------
-# ユーティリティ
+# ClipTask / VideoSource プロトコル
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ClipTask:
+    """1 クリップ (= 出力サブディレクトリ) に対応する処理単位。
+
+    Attributes:
+        video_path: 入力動画のパス
+        clip_id:    出力サブディレクトリ名 (例: "00042")
+        video_name: 出力親ディレクトリ名 (例: "20251220_DJI_0098")
+    """
+    video_path: str
+    clip_id: str
+    video_name: str
+
+
+class VideoSource:
+    """動画入力の抽象化 — _worker にフレームを供給するプラグインインターフェース。
+
+    実装上の制約:
+    - pickle 可能であること (spawn コンテキストでワーカーに渡すため)
+    - iter_frames() 内で cv2.VideoCapture を開くこと (ファイルハンドルを保持しない)
+    """
+
+    def discover(self, out_dir: Path) -> Tuple[List[ClipTask], int, int]:
+        """入力を探索し、処理対象のタスクリストを返す。
+
+        Returns:
+            (pending_tasks, skipped_count, total_count)
+        """
+        raise NotImplementedError
+
+    def iter_frames(self, task: ClipTask) -> Iterator[np.ndarray]:
+        """1 タスク分の BGR フレーム (np.ndarray) を yield する。"""
+        raise NotImplementedError
+
+    def count_frames(self, tasks: List[ClipTask]) -> int:
+        """総フレーム数を推定する (プログレスバー用)。"""
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# スキップ判定ユーティリティ
+# ---------------------------------------------------------------------------
+
+def is_task_complete(out_dir: Path, video_name: str, clip_id: str) -> bool:
+    """指定タスクが処理済みか判定 (coords.npy 存在 + JPEG 枚数一致)。"""
+    clip_dir    = out_dir / video_name / clip_id
+    coords_path = clip_dir / COORDS_FILE
+    if not coords_path.exists():
+        return False
+    try:
+        coords_arr   = np.load(str(coords_path))
+        valid_count  = int((coords_arr[:, 0] >= 0).sum())
+        existing_jpg = len(list(clip_dir.glob("*.jpg")))
+        return existing_jpg == valid_count
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# 顔検出ユーティリティ
 # ---------------------------------------------------------------------------
 
 def select_best_face(faces, frame_w: int, frame_h: int):
     """YuNet の検出結果から最も中央に近い大きな顔を選ぶ。
-
-    Args:
-        faces: cv2.FaceDetectorYN.detect() の出力 (N×15+) または None
-        frame_w: 検出フレームの幅 (det 座標系)
-        frame_h: 検出フレームの高さ (det 座標系)
 
     Returns:
         [x, y, w, h] (det 座標系) または None
@@ -101,13 +149,6 @@ def det_box_to_orig(
 ) -> list:
     """YuNet 検出ボックス (det 座標系) → 元フレーム座標系 + マージン付加。
 
-    Args:
-        box_xywh: [x, y, w, h] (det 座標系)
-        det_scale: 検出時の縮小率 (例: 0.5)
-        frame_w: 元フレームの幅
-        frame_h: 元フレームの高さ
-        margin: ボックス拡張率 (例: 0.25 → 各辺を 25% 拡張)
-
     Returns:
         [x1, y1, x2, y2] (int, 元フレーム座標系, クリップ済み)
     """
@@ -125,38 +166,59 @@ def det_box_to_orig(
     return [x1, y1, x2, y2]
 
 
+def _det_box_to_orig_xy(
+    box_xywh,
+    scale_x: float,
+    scale_y: float,
+    frame_w: int,
+    frame_h: int,
+    margin: float,
+) -> list:
+    """det_box_to_orig の x/y 個別スケール版 (32 倍丸め対応)。"""
+    x, y, fw, fh = box_xywh
+    x_orig = x  / scale_x
+    y_orig = y  / scale_y
+    w_orig = fw / scale_x
+    h_orig = fh / scale_y
+    mx = w_orig * margin
+    my = h_orig * margin
+    x1 = max(0,       int(x_orig - mx))
+    y1 = max(0,       int(y_orig - my))
+    x2 = min(frame_w, int(x_orig + w_orig + mx))
+    y2 = min(frame_h, int(y_orig + h_orig + my))
+    return [x1, y1, x2, y2]
+
+
 # ---------------------------------------------------------------------------
 # ワーカープロセス本体
 # ---------------------------------------------------------------------------
 
 def _worker(
     worker_id:      int,
-    clip_paths:     list,
+    tasks:          list,
     out_dir:        str,
     yunet_model:    str,
+    source:         "VideoSource",
     det_scale:      float,
     bbox_margin:    float,
     face_size:      int,
     jpeg_quality:   int,
-    frames_counter,       # ctx.Value('i') - spawn コンテキストで作成すること
-    clips_counter,        # ctx.Value('i') - 同上
+    frames_counter,
+    clips_counter,
 ) -> None:
-    """並列ワーカー。担当クリップを順番に処理する。
+    """並列ワーカー。担当タスクを順番に処理する。
 
-    設計上の注意:
-    - cv2.setNumThreads(1) + 環境変数でスレッド数を制限し、CPU 競合を防ぐ。
-    - ストリーミングデコードで 1 フレームずつ処理し、メモリ使用量を最小化。
-    - frames_counter / clips_counter は spawn コンテキストの ctx.Value で
-      作成しなければ lock がクラッシュする (fork context の mp.Value は不可)。
+    source.iter_frames(task) でフレームを受け取り、
+    YuNet で顔検出 → クロップ → JPEG 保存を行う。
     """
-    # OpenCV と数値演算ライブラリのスレッドを 1 に制限
     cv2.setNumThreads(1)
     os.environ["OMP_NUM_THREADS"]      = "1"
     os.environ["MKL_NUM_THREADS"]      = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
     if not os.path.exists(yunet_model):
-        print(f"[worker {worker_id}] ERROR: YuNet model not found: {yunet_model}", flush=True)
+        print(f"[worker {worker_id}] ERROR: YuNet model not found: {yunet_model}",
+              flush=True)
         return
 
     detector = cv2.FaceDetectorYN.create(
@@ -169,52 +231,38 @@ def _worker(
         target_id=cv2.dnn.DNN_TARGET_CPU,
     )
 
-    out_root     = Path(out_dir)
-    local_frames = 0
+    out_root       = Path(out_dir)
+    local_frames   = 0
+    flushed_frames = 0
 
-    for clip_path in clip_paths:
-        clip_path   = Path(clip_path)
-        video_name  = clip_path.parent.name
-        clip_name   = clip_path.stem
-        clip_out    = out_root / video_name / clip_name
+    for task in tasks:
+        clip_out    = out_root / task.video_name / task.clip_id
         coords_path = clip_out / COORDS_FILE
 
-        # --- スキップ判定: coords.npy + JPEG 枚数が一致していれば処理済み ---
-        if coords_path.exists():
-            try:
-                coords_arr  = np.load(str(coords_path))
-                valid_count = int((coords_arr[:, 0] >= 0).sum())
-                existing_jpg = len(list(clip_out.glob("*.jpg")))
-                if existing_jpg == valid_count:
-                    with clips_counter.get_lock():
-                        clips_counter.value += 1
-                    continue
-            except Exception:
-                pass  # coords.npy が壊れている場合は再処理
-
         clip_out.mkdir(parents=True, exist_ok=True)
-
-        cap = cv2.VideoCapture(str(clip_path))
-        ok, first_frame = cap.read()
-        if not ok:
-            cap.release()
-            with clips_counter.get_lock():
-                clips_counter.value += 1
-            continue
-
-        frame_h, frame_w = first_frame.shape[:2]
-        det_w = int(frame_w * det_scale)
-        det_h = int(frame_h * det_scale)
-        detector.setInputSize((det_w, det_h))
-
         coords_list = []
+        frame_idx   = 0
+        frame_w = frame_h = det_w = det_h = 0
 
-        def _process_one(frame, frame_idx: int) -> None:
-            small     = cv2.resize(frame, (det_w, det_h))
-            _, faces  = detector.detect(small)
-            box       = select_best_face(faces, det_w, det_h)
+        scale_x = scale_y = det_scale
+
+        for frame in source.iter_frames(task):
+            if frame_idx == 0:
+                frame_h, frame_w = frame.shape[:2]
+                det_w = max(32, int(frame_w * det_scale) // 32 * 32)
+                det_h = max(32, int(frame_h * det_scale) // 32 * 32)
+                scale_x = det_w / frame_w
+                scale_y = det_h / frame_h
+                detector.setInputSize((det_w, det_h))
+
+            small    = cv2.resize(frame, (det_w, det_h))
+            _, faces = detector.detect(small)
+            box      = select_best_face(faces, det_w, det_h)
+
             if box is not None:
-                coord = det_box_to_orig(box, det_scale, frame_w, frame_h, bbox_margin)
+                coord = _det_box_to_orig_xy(
+                    box, scale_x, scale_y, frame_w, frame_h, bbox_margin,
+                )
                 coords_list.append(coord)
                 x1, y1, x2, y2 = coord
                 face_raw = frame[y1:y2, x1:x2]
@@ -231,30 +279,24 @@ def _worker(
             else:
                 coords_list.append([-1, -1, -1, -1])
 
-        _process_one(first_frame, 0)
-        local_frames += 1
-
-        frame_idx = 1
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            _process_one(frame, frame_idx)
+            frame_idx    += 1
             local_frames += 1
-            frame_idx   += 1
 
-            if local_frames % COUNTER_FLUSH_EVERY == 0:
+            if (local_frames - flushed_frames) >= COUNTER_FLUSH_EVERY:
                 with frames_counter.get_lock():
                     frames_counter.value += COUNTER_FLUSH_EVERY
+                flushed_frames += COUNTER_FLUSH_EVERY
 
-        cap.release()
-
-        remainder = local_frames % COUNTER_FLUSH_EVERY
-        if remainder:
+        unflushed = local_frames - flushed_frames
+        if unflushed > 0:
             with frames_counter.get_lock():
-                frames_counter.value += remainder
+                frames_counter.value += unflushed
+            flushed_frames = local_frames
 
-        np.save(str(coords_path), np.array(coords_list, dtype=np.int32))
+        if coords_list:
+            np.save(str(coords_path), np.array(coords_list, dtype=np.int32))
+        else:
+            np.save(str(coords_path), np.zeros((0, 4), dtype=np.int32))
 
         with clips_counter.get_lock():
             clips_counter.value += 1
@@ -295,98 +337,54 @@ def _monitor(
 
 
 # ---------------------------------------------------------------------------
-# メイン
+# Python API
 # ---------------------------------------------------------------------------
 
-def _count_frames_fast(clip_paths: list) -> int:
-    """動画メタデータからフレーム数を合算する (デコードなし, 高速)。"""
-    total = 0
-    for p in clip_paths:
-        cap = cv2.VideoCapture(str(p))
-        n   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        total += max(n, 0)
-    return total
+def run(
+    source:       "VideoSource",
+    out_dir:      str,
+    yunet:        str,
+    workers:      int   = DEFAULT_WORKERS,
+    det_scale:    float = DEFAULT_DET_SCALE,
+    bbox_margin:  float = DEFAULT_BBOX_MARGIN,
+    face_size:    int   = DEFAULT_FACE_SIZE,
+    jpeg_quality: int   = DEFAULT_JPEG_QUALITY,
+) -> None:
+    """VideoSource からフレームを受け取り、顔を検出・クロップして JPEG 保存する。
 
+    Args:
+        source: フレーム供給元 (DefaultClipSource / VADSource / カスタム)
+        out_dir: 出力ディレクトリ
+        yunet: YuNet ONNX モデルのパス
+        workers: ワーカープロセス数
+    """
+    out_root = Path(out_dir)
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Parallel face crop preprocessing using YuNet (CPU-only)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--clips_dir", required=True,
-        help="入力: 動画クリップのルートディレクトリ ({video}/{clip}.mp4 の構造)",
-    )
-    parser.add_argument(
-        "--out_dir", required=True,
-        help="出力: クロップ済み JPEG と coords.npy の保存先",
-    )
-    parser.add_argument(
-        "--yunet", required=True,
-        help="YuNet ONNX モデルのパス (face_detection_yunet_2023mar.onnx)",
-    )
-    parser.add_argument("--workers",      type=int,   default=DEFAULT_WORKERS)
-    parser.add_argument("--det_scale",    type=float, default=DEFAULT_DET_SCALE,
-                        help="顔検出時のフレーム縮小率")
-    parser.add_argument("--bbox_margin",  type=float, default=DEFAULT_BBOX_MARGIN,
-                        help="検出ボックスの拡張率 (各辺)")
-    parser.add_argument("--face_size",    type=int,   default=DEFAULT_FACE_SIZE,
-                        help="出力 JPEG のサイズ (正方形, px)")
-    parser.add_argument("--jpeg_quality", type=int,   default=DEFAULT_JPEG_QUALITY)
-    args = parser.parse_args()
+    pending, skipped, total = source.discover(out_root)
+    print(f"総タスク数: {total}, workers: {workers}", flush=True)
+    print(f"スキップ: {skipped} / 処理対象: {len(pending)}", flush=True)
 
-    clips_root = Path(args.clips_dir)
-    all_clips  = sorted(clips_root.rglob("*.mp4"))
-    print(f"総クリップ数: {len(all_clips)}, workers: {args.workers}", flush=True)
-
-    if not all_clips:
-        print("ERROR: クリップが見つかりません。--clips_dir を確認してください。")
-        return
-
-    # スキップ済みクリップを除外して処理対象を特定
-    out_root      = Path(args.out_dir)
-    pending_clips = []
-    skipped       = 0
-    for clip in all_clips:
-        coords_path = out_root / clip.parent.name / clip.stem / COORDS_FILE
-        if coords_path.exists():
-            try:
-                coords_arr   = np.load(str(coords_path))
-                valid_count  = int((coords_arr[:, 0] >= 0).sum())
-                existing_jpg = len(list((out_root / clip.parent.name / clip.stem).glob("*.jpg")))
-                if existing_jpg == valid_count:
-                    skipped += 1
-                    continue
-            except Exception:
-                pass
-        pending_clips.append(clip)
-
-    print(f"スキップ: {skipped} / 処理対象: {len(pending_clips)}", flush=True)
-    if not pending_clips:
-        print("全クリップ処理済みです。")
+    if not pending:
+        print("全タスク処理済みです。")
         return
 
     print("総フレーム数を集計中...", end=" ", flush=True)
-    total_frames = _count_frames_fast(pending_clips)
+    total_frames = source.count_frames(pending)
     print(f"{total_frames:,} frames", flush=True)
 
     ctx = mp.get_context("spawn")
 
-    # クリップをラウンドロビンでワーカーに分配
-    chunks = [[] for _ in range(args.workers)]
-    for i, clip in enumerate(pending_clips):
-        chunks[i % args.workers].append(str(clip))
+    chunks = [[] for _ in range(workers)]
+    for i, task in enumerate(pending):
+        chunks[i % workers].append(task)
 
-    # 共有カウンタは必ず ctx.Value で作成する
-    # (mp.Value はデフォルトの fork コンテキストを使うため spawn プロセスでは lock がクラッシュする)
     frames_counter = ctx.Value('i', 0)
     clips_counter  = ctx.Value('i', skipped)
 
     done_event     = threading.Event()
     monitor_thread = threading.Thread(
         target=_monitor,
-        args=(frames_counter, clips_counter, total_frames, len(all_clips), done_event),
+        args=(frames_counter, clips_counter, total_frames, total, done_event),
         daemon=True,
     )
     monitor_thread.start()
@@ -399,8 +397,9 @@ def main() -> None:
         p = ctx.Process(
             target=_worker,
             args=(
-                wid, chunk, args.out_dir, args.yunet,
-                args.det_scale, args.bbox_margin, args.face_size, args.jpeg_quality,
+                wid, chunk, out_dir, yunet,
+                source,
+                det_scale, bbox_margin, face_size, jpeg_quality,
                 frames_counter, clips_counter,
             ),
         )
@@ -420,6 +419,72 @@ def main() -> None:
         f"\n完了: {elapsed:.1f}s ({elapsed / 3600:.2f}h) | "
         f"JPG: {total_jpg:,} | coords.npy: {total_npy}",
         flush=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Parallel face crop using YuNet (CPU-only)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # Clip mode
+    parser.add_argument(
+        "--clips_dir", default=None,
+        help="Clip mode: root dir of video clips ({video}/{clip}.mp4)",
+    )
+    # VAD mode
+    parser.add_argument(
+        "--videos_dir", default=None,
+        help="VAD mode: directory containing source videos",
+    )
+    parser.add_argument(
+        "--vad_dir", default=None,
+        help="VAD mode: directory containing {stem}/vad.json",
+    )
+    parser.add_argument(
+        "--target_fps", type=float, default=25.0,
+        help="VAD mode: target fps for frame subsampling",
+    )
+    # Common
+    parser.add_argument("--out_dir",      required=True,
+                        help="Output directory for cropped JPEG + coords.npy")
+    parser.add_argument("--yunet",        required=True,
+                        help="Path to YuNet ONNX model")
+    parser.add_argument("--workers",      type=int,   default=DEFAULT_WORKERS)
+    parser.add_argument("--det_scale",    type=float, default=DEFAULT_DET_SCALE,
+                        help="Detection frame downscale ratio")
+    parser.add_argument("--bbox_margin",  type=float, default=DEFAULT_BBOX_MARGIN,
+                        help="Bounding box margin ratio per side")
+    parser.add_argument("--face_size",    type=int,   default=DEFAULT_FACE_SIZE,
+                        help="Output JPEG size (square, px)")
+    parser.add_argument("--jpeg_quality", type=int,   default=DEFAULT_JPEG_QUALITY)
+    args = parser.parse_args()
+
+    try:
+        from face_crop_parallel._sources import DefaultClipSource, VADSource
+    except ImportError:
+        from _sources import DefaultClipSource, VADSource
+
+    if args.videos_dir and args.vad_dir:
+        source = VADSource(args.videos_dir, args.vad_dir, args.target_fps)
+    elif args.clips_dir:
+        source = DefaultClipSource(args.clips_dir)
+    else:
+        parser.error("--clips_dir or (--videos_dir + --vad_dir) is required")
+
+    run(
+        source=source,
+        out_dir=args.out_dir,
+        yunet=args.yunet,
+        workers=args.workers,
+        det_scale=args.det_scale,
+        bbox_margin=args.bbox_margin,
+        face_size=args.face_size,
+        jpeg_quality=args.jpeg_quality,
     )
 
 
